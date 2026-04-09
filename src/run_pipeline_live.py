@@ -6,6 +6,21 @@ import clip
 from PIL import Image
 from collections import deque
 
+try:
+    from ultralytics import YOLO
+    from ultralytics.nn.tasks import DetectionModel
+    import ultralytics.nn.modules as yolo_modules
+    import torch.nn.modules as torch_modules
+    import torch.nn.modules.conv as torch_conv
+    import torch.nn.modules.linear as torch_linear
+    import torch.nn.modules.batchnorm as torch_batchnorm
+    import torch.nn.modules.activation as torch_activation
+    from torch.nn.modules.container import Sequential
+    from torch.nn.modules.module import Module
+    YOLO_AVAILABLE = True
+except ImportError:
+    YOLO_AVAILABLE = False
+
 from model import DSANet
 from utils.tools import get_batch_mask, get_prompt_text
 import ucf_option
@@ -38,6 +53,83 @@ def refine_scores_hierarchical(logits_mlp, logits_align, temp=5.0):
     final_probabilities = torch.cat([total_normal_prob, final_abnormal_probs], dim=1)
 
     return final_probabilities
+
+
+def build_interest_class_ids(yolo_model):
+    interest = {
+        "person",
+        "car", "truck", "bus", "motorcycle", "motorbike", "bicycle",
+        "train", "boat", "airplane",
+        "knife", "scissors"
+    }
+    return [cls_id for cls_id, name in yolo_model.names.items() if name in interest]
+
+
+def draw_yolo_detections(frame, result, interest_class_ids):
+    detections = []
+    if result is None or len(result.boxes) == 0:
+        return frame, detections
+
+    for box in result.boxes:
+        cls_id = int(box.cls.item())
+        if interest_class_ids is not None and cls_id not in interest_class_ids:
+            continue
+
+        name = result.names[cls_id]
+        conf = float(box.conf.item())
+        xyxy = box.xyxy[0].cpu().numpy().astype(int)
+        x1, y1, x2, y2 = xyxy
+
+        if name == "person":
+            color = (0, 255, 0)
+        elif name in {"car", "truck", "bus", "motorcycle", "bicycle", "train", "boat", "airplane"}:
+            color = (255, 128, 0)
+        else:
+            color = (0, 165, 255)
+
+        cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+        cv2.putText(frame, f"{name} {conf:.2f}", (x1, max(y1 - 6, 15)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1, cv2.LINE_AA)
+        detections.append(name)
+
+    return frame, detections
+
+
+def load_yolo_detector(weights="yolov8n.pt", device="cpu"):
+    if not YOLO_AVAILABLE:
+        return None, []
+
+    try:
+        if hasattr(torch.serialization, 'safe_globals'):
+            safe_list = [DetectionModel, Sequential, Module]
+            safe_list += [getattr(yolo_modules, name) for name in dir(yolo_modules)
+                          if not name.startswith("_") and callable(getattr(yolo_modules, name))]
+            safe_list += [getattr(torch_modules, name) for name in dir(torch_modules)
+                          if not name.startswith("_") and callable(getattr(torch_modules, name))]
+            safe_list += [getattr(torch_conv, name) for name in dir(torch_conv)
+                          if not name.startswith("_") and callable(getattr(torch_conv, name))]
+            safe_list += [getattr(torch_linear, name) for name in dir(torch_linear)
+                          if not name.startswith("_") and callable(getattr(torch_linear, name))]
+            safe_list += [getattr(torch_batchnorm, name) for name in dir(torch_batchnorm)
+                          if not name.startswith("_") and callable(getattr(torch_batchnorm, name))]
+            safe_list += [getattr(torch_activation, name) for name in dir(torch_activation)
+                          if not name.startswith("_") and callable(getattr(torch_activation, name))]
+            with torch.serialization.safe_globals(safe_list):
+                yolo = YOLO(weights)
+        else:
+            torch.serialization.add_safe_globals([DetectionModel, Sequential, Module])
+            yolo = YOLO(weights)
+    except Exception as e:
+        print(f"⚠ Failed to load YOLO weights: {e}")
+        return None, []
+
+    try:
+        yolo.to(device)
+    except Exception:
+        pass
+
+    interest_ids = build_interest_class_ids(yolo)
+    return yolo, interest_ids
 
 
 # -------------------------------------------------
@@ -110,6 +202,11 @@ def live_detection(model_path, source=0, buffer_size=32, skip=3):
     model.to(device)
     model.eval()
 
+    # ---- Load YOLOv8 object detector ----
+    yolo_detector, yolo_interest_ids = load_yolo_detector(device=device)
+    if yolo_detector is None:
+        print("⚠ YOLOv8 object detection unavailable. Install 'ultralytics' to enable boxes and person/vehicle detection.")
+
     # ---- Video Source ----
     cap = cv2.VideoCapture(source)  # 0 = webcam OR RTSP URL
 
@@ -144,6 +241,7 @@ def live_detection(model_path, source=0, buffer_size=32, skip=3):
 
         label = "Buffering..."
         score = 0.0
+        detection_label = ""
 
         # ---- Inference ----
         if len(buffer) == buffer_size:
@@ -155,12 +253,26 @@ def live_detection(model_path, source=0, buffer_size=32, skip=3):
 
             print(f"Score: {score:.3f} | {label}")
 
+        # ---- YOLOv8 object detection and boxes ----
+        if yolo_detector is not None:
+            results = yolo_detector(frame, imgsz=640, conf=0.25, classes=yolo_interest_ids)
+            if len(results) > 0:
+                frame, detections = draw_yolo_detections(frame, results[0], yolo_interest_ids)
+                detection_label = ", ".join(sorted(set(detections))) if detections else "No objects"
+            else:
+                detection_label = "No objects"
+
         # ---- Display ----
         color = (0, 0, 255) if score > 0.45 else (0, 255, 0)
 
         cv2.putText(frame, f"{label} ({score:.2f})",
                     (20, 40), cv2.FONT_HERSHEY_SIMPLEX,
                     1, color, 2)
+
+        if detection_label:
+            cv2.putText(frame, f"YOLO: {detection_label}",
+                        (20, 75), cv2.FONT_HERSHEY_SIMPLEX,
+                        0.7, (255, 255, 0), 2)
 
         cv2.imshow("Live Anomaly Detection", frame)
 
@@ -181,7 +293,7 @@ if __name__ == "__main__":
     # "rtsp://..." → CCTV camera
     # "video.mp4" → video file (for testing)
 
-    SOURCE = "http://100.80.253.25:8080/video"
+    SOURCE = "http://10.50.55.238:8080/video"
 
     live_detection(
         model_path=MODEL_PATH,
