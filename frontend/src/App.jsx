@@ -90,13 +90,149 @@ function DangerBadge({ type }) {
   );
 }
 
+/* ── Lightbox Modal ── */
+function LightboxModal({ event, onClose }) {
+  useEffect(() => {
+    const onKey = (e) => { if (e.key === "Escape") onClose(); };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [onClose]);
+
+  if (!event) return null;
+  return (
+    <div
+      onClick={onClose}
+      style={{
+        position: "fixed", inset: 0, zIndex: 1000,
+        background: "rgba(0,0,0,0.88)",
+        display: "flex", alignItems: "center", justifyContent: "center",
+        backdropFilter: "blur(6px)",
+        animation: "fadeIn 0.18s ease",
+      }}
+    >
+      <div
+        onClick={e => e.stopPropagation()}
+        style={{
+          position: "relative",
+          background: "#0d1117",
+          border: "1px solid #1e2533",
+          borderRadius: 14,
+          overflow: "hidden",
+          maxWidth: "min(92vw, 960px)",
+          width: "100%",
+          boxShadow: "0 32px 80px rgba(0,0,0,0.7)",
+          display: "flex", flexDirection: "column",
+        }}
+      >
+        {/* Close button */}
+        <button
+          onClick={onClose}
+          style={{
+            position: "absolute", top: 12, right: 12, zIndex: 2,
+            background: "rgba(9,12,20,0.8)", border: "1px solid #1e2533",
+            color: "#a0aec0", borderRadius: 8, width: 32, height: 32,
+            fontSize: 16, cursor: "pointer", display: "flex",
+            alignItems: "center", justifyContent: "center",
+            transition: "all 0.2s",
+          }}
+          onMouseEnter={e => { e.currentTarget.style.borderColor = "#ff2d2d"; e.currentTarget.style.color = "#ff2d2d"; }}
+          onMouseLeave={e => { e.currentTarget.style.borderColor = "#1e2533"; e.currentTarget.style.color = "#a0aec0"; }}
+        >✕</button>
+
+        {/* Full image */}
+        <div style={{ background: "#000", position: "relative" }}>
+          <img
+            src={`${API}/api/history/${event.id}/frame`}
+            alt={`Event ${event.id}`}
+            style={{ width: "100%", maxHeight: "65vh", objectFit: "contain", display: "block" }}
+          />
+          <div style={{ position: "absolute", top: 10, left: 10 }}>
+            <DangerBadge type={event.danger_type} />
+          </div>
+          <div style={{
+            position: "absolute", bottom: 10, right: 14,
+            fontFamily: "'JetBrains Mono', monospace", fontSize: 20, fontWeight: 700,
+            color: event.score > 0.7 ? "#ff2d2d" : "#ffaa00",
+            textShadow: "0 0 10px rgba(0,0,0,0.9)",
+          }}>{event.score.toFixed(3)}</div>
+        </div>
+
+        {/* Metadata strip */}
+        <div style={{ padding: "14px 18px", display: "flex", flexWrap: "wrap", gap: 18, alignItems: "center" }}>
+          <div>
+            <div style={{ fontSize: 9, color: "#4a5568", letterSpacing: 2, marginBottom: 3 }}>TIMESTAMP</div>
+            <div style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: 12, color: "#e2e8f0" }}>{event.timestamp}</div>
+          </div>
+          <div>
+            <div style={{ fontSize: 9, color: "#4a5568", letterSpacing: 2, marginBottom: 3 }}>LABEL</div>
+            <div style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: 12, color: "#e2e8f0" }}>{event.label}</div>
+          </div>
+          {event.crime_type && event.crime_type !== "Unknown" && (
+            <div>
+              <div style={{ fontSize: 9, color: "#4a5568", letterSpacing: 2, marginBottom: 3 }}>CRIME TYPE</div>
+              <div style={{ fontSize: 12, color: "#00e5a0", textTransform: "uppercase" }}>🔍 {event.crime_type}</div>
+            </div>
+          )}
+          {event.weapons && event.weapons.length > 0 && (
+            <div>
+              <div style={{ fontSize: 9, color: "#4a5568", letterSpacing: 2, marginBottom: 3 }}>WEAPONS</div>
+              <div style={{ fontSize: 12, color: "#ff8c00" }}>🔫 {event.weapons.join(", ")}</div>
+            </div>
+          )}
+          <a
+            href={`${API}/api/history/${event.id}/frame`}
+            download={`event_${event.id}.jpg`}
+            target="_blank"
+            rel="noreferrer"
+            style={{
+              marginLeft: "auto", padding: "7px 16px",
+              background: "transparent", border: "1px solid #1e2533",
+              color: "#a0aec0", borderRadius: 6, fontSize: 11,
+              fontFamily: "'JetBrains Mono', monospace", letterSpacing: 1,
+              textDecoration: "none", cursor: "pointer", transition: "all 0.2s",
+            }}
+            onMouseEnter={e => { e.currentTarget.style.borderColor = "#00e5a0"; e.currentTarget.style.color = "#00e5a0"; }}
+            onMouseLeave={e => { e.currentTarget.style.borderColor = "#1e2533"; e.currentTarget.style.color = "#a0aec0"; }}
+          >⬇ DOWNLOAD</a>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 /* ── History Card ── */
-function HistoryCard({ event }) {
+function HistoryCard({ event, onOpen }) {
+  const [hovered, setHovered] = useState(false);
   return (
     <div style={{ background: "#0d1117", border: "1px solid #1e2533", borderRadius: 10, overflow: "hidden", display: "flex", flexDirection: "column" }}>
-      <div style={{ position: "relative", background: "#000", aspectRatio: "16/9", overflow: "hidden" }}>
+      <div
+        onClick={() => onOpen(event)}
+        onMouseEnter={() => setHovered(true)}
+        onMouseLeave={() => setHovered(false)}
+        style={{ position: "relative", background: "#000", aspectRatio: "16/9", overflow: "hidden", cursor: "zoom-in" }}
+      >
         <img src={`${API}/api/history/${event.id}/frame`} alt={`Event ${event.id}`} loading="lazy"
-          style={{ width: "100%", height: "100%", objectFit: "cover", display: "block" }} />
+          style={{
+            width: "100%", height: "100%", objectFit: "cover", display: "block",
+            transform: hovered ? "scale(1.04)" : "scale(1)",
+            transition: "transform 0.3s ease",
+          }} />
+        {/* Hover overlay */}
+        <div style={{
+          position: "absolute", inset: 0,
+          background: hovered ? "rgba(0,229,160,0.08)" : "transparent",
+          display: "flex", alignItems: "center", justifyContent: "center",
+          transition: "background 0.3s",
+        }}>
+          {hovered && (
+            <div style={{
+              background: "rgba(9,12,20,0.75)", border: "1px solid rgba(0,229,160,0.4)",
+              borderRadius: 8, padding: "6px 14px",
+              fontSize: 11, color: "#00e5a0", letterSpacing: 2,
+              fontFamily: "'JetBrains Mono', monospace", fontWeight: 700,
+            }}>🔍 VIEW FULL</div>
+          )}
+        </div>
         <div style={{ position: "absolute", top: 6, left: 6 }}>
           <DangerBadge type={event.danger_type} />
         </div>
@@ -137,6 +273,7 @@ export default function App() {
   const [historyData,  setHistoryData]  = useState([]);
   const [historyTotal, setHistoryTotal] = useState(0);
   const [historyPage,  setHistoryPage]  = useState(0);
+  const [lightboxEvent, setLightboxEvent] = useState(null);
 
   const [source,     setSource]     = useState("http://100.80.253.25:8080/video");
   const [bufferSize, setBufferSize] = useState(32);
@@ -238,7 +375,10 @@ export default function App() {
         ::-webkit-scrollbar-track { background: #111827; }
         ::-webkit-scrollbar-thumb { background: #1e2533; border-radius: 4px; }
         @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.3} }
+        @keyframes fadeIn { from{opacity:0;transform:scale(0.97)} to{opacity:1;transform:scale(1)} }
       `}</style>
+
+      {lightboxEvent && <LightboxModal event={lightboxEvent} onClose={() => setLightboxEvent(null)} />}
 
       {/* Top Bar */}
       <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between",
@@ -435,7 +575,7 @@ export default function App() {
                 NO DANGER EVENTS RECORDED YET
               </div>
             ) : (
-              historyData.map(ev => <HistoryCard key={ev.id} event={ev} />)
+              historyData.map(ev => <HistoryCard key={ev.id} event={ev} onOpen={setLightboxEvent} />)
             )}
           </div>
 
