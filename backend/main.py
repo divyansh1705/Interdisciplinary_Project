@@ -1,13 +1,21 @@
 """
 FastAPI Backend for DSANet Live Anomaly Detection GUI
-Run with: uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+Run with:  cd ~/Interdisciplinary_Project_YOLO/backend && uvicorn main:app --host 0.0.0.0 --port 8000 --reload
 """
+
+# ── MUST be first: ensure src/ is on sys.path before any project imports ──────
+import os, sys
+_THIS_DIR = os.path.dirname(os.path.abspath(__file__))
+_SRC_DIR  = os.path.join(os.path.dirname(_THIS_DIR), "src")
+if _SRC_DIR not in sys.path:
+    sys.path.insert(0, _SRC_DIR)
 
 import asyncio
 import threading
 import time
-import os
 import json
+import sqlite3
+import base64
 from collections import deque
 from typing import Optional, List
 from pathlib import Path
@@ -18,29 +26,109 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from PIL import Image
+from transformers import pipeline
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
-# ── Your existing project imports ──────────────────────────────────────────────
-import sys
-SRC_DIR = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, SRC_DIR)
-BASE_DIR = Path(__file__).resolve().parent
+# ── Project imports (resolved from src/) ──────────────────────────────────────
+BASE_DIR = Path(_THIS_DIR)
 ROOT_DIR = BASE_DIR.parent
 SRC_PATH = ROOT_DIR / "src"
-sys.path.insert(0, str(SRC_PATH))
 
-MODEL_PATH = BASE_DIR.parent / "model" / "model_ucf.pth"
+MODEL_PATH = ROOT_DIR / "model" / "model_ucf.pth"
+
+# A pip package "utils" shadows src/utils — force-load the correct one
+import importlib.util
+def _force_import(module_name, file_path):
+    spec = importlib.util.spec_from_file_location(module_name, str(file_path))
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = mod
+    spec.loader.exec_module(mod)
+    return mod
+
+_force_import("utils", str(SRC_PATH / "utils" / "__init__.py"))
+_tools = _force_import("utils.tools", str(SRC_PATH / "utils" / "tools.py"))
+get_batch_mask = _tools.get_batch_mask
+get_prompt_text = _tools.get_prompt_text
 
 import clip
-from utils.tools import get_batch_mask, get_prompt_text
 from model import DSANet
 import ucf_option
 
 # ── Paths ──────────────────────────────────────────────────────────────────────
+DB_PATH = BASE_DIR / "danger_history.db"
+
+# ── SQLite DB Init ─────────────────────────────────────────────────────────────
+def init_db():
+    """Create the danger_events table if it does not already exist."""
+    con = sqlite3.connect(str(DB_PATH))
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS danger_events (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp   TEXT    NOT NULL,
+            score       REAL    NOT NULL,
+            label       TEXT    NOT NULL,
+            danger_type TEXT    NOT NULL,   -- 'crime' | 'weapon' | 'both'
+            weapons     TEXT    NOT NULL,   -- JSON list of weapon names
+            frame_jpeg  BLOB    NOT NULL    -- raw JPEG bytes of the annotated frame
+        )
+    """)
+    try:
+        con.execute("ALTER TABLE danger_events ADD COLUMN crime_type TEXT DEFAULT 'Unknown'")
+    except sqlite3.OperationalError:
+        pass
+    con.commit()
+    con.close()
+
+init_db()
+
+
+_hf_classifier = None
+_hf_lock = threading.Lock()
+
+def _get_hf_classifier():
+    global _hf_classifier
+    if _hf_classifier is None:
+        with _hf_lock:
+            if _hf_classifier is None:
+                print("[HF] Loading crime_type_cctv_image_detection pipeline... (this might take a moment)")
+                device = "cuda" if torch.cuda.is_available() else "cpu"
+                _hf_classifier = pipeline(
+                    "image-classification",
+                    model="dima806/crime_type_cctv_image_detection",
+                    device=device
+                )
+    return _hf_classifier
+
+def save_danger_frame(score: float, label: str, danger_type: str,
+                      weapons: list, frame_bgr):
+    """Persist one danger event (annotated frame + metadata) to SQLite."""
+    # Run HF classification
+    try:
+        classifier = _get_hf_classifier()
+        rgb_frame = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+        pil_img = Image.fromarray(rgb_frame)
+        preds = classifier(pil_img)
+        crime_type = preds[0]['label']
+    except Exception as e:
+        print(f"[HF] Classification failed: {e}")
+        crime_type = "Unknown"
+
+    _, buf = cv2.imencode(".jpg", frame_bgr, [cv2.IMWRITE_JPEG_QUALITY, 80])
+    jpeg_bytes = buf.tobytes()
+    ts = time.strftime("%Y-%m-%d %H:%M:%S")
+    con = sqlite3.connect(str(DB_PATH))
+    con.execute(
+        "INSERT INTO danger_events (timestamp,score,label,danger_type,weapons,frame_jpeg,crime_type) "
+        "VALUES (?,?,?,?,?,?,?)",
+        (ts, round(score, 4), label, danger_type, json.dumps(weapons), jpeg_bytes, crime_type)
+    )
+    con.commit()
+    con.close()
+
 
 # ── App ────────────────────────────────────────────────────────────────────────
 app = FastAPI(title="DSANet Anomaly Detection API")
@@ -54,6 +142,16 @@ app.add_middleware(
 )
 
 # ── Shared State ───────────────────────────────────────────────────────────────
+def _db_count() -> int:
+    """Return total rows in danger_events (0 if table missing)."""
+    try:
+        con = sqlite3.connect(str(DB_PATH))
+        n = con.execute("SELECT COUNT(*) FROM danger_events").fetchone()[0]
+        con.close()
+        return n
+    except Exception:
+        return 0
+
 state = {
     "running":      False,
     "score":        0.0,
@@ -67,6 +165,7 @@ state = {
     "threshold":    0.45,
     "device":       "N/A",
     "score_history": [],         # last N scores
+    "history_count": _db_count(), # seeded from DB so it persists across restarts
 }
 
 _lock         = threading.Lock()
@@ -116,6 +215,51 @@ def infer_buffer(model, visual_features, prompt_text, args, device):
         return anomaly_scores.max().item()
 
 
+# ── YOLO helpers (same as run_pipeline_live) ──────────────────────────────────
+try:
+    from ultralytics import YOLO as _YOLO
+    _YOLO_AVAILABLE = True
+except ImportError:
+    _YOLO_AVAILABLE = False
+
+_GUN_COLOR = (0, 0, 255)
+
+def _build_interest_ids(yolo_model):
+    return list(yolo_model.names.keys())
+
+def _draw_yolo(frame, result, interest_ids):
+    detections, box_info = [], []
+    if result is None or len(result.boxes) == 0:
+        return frame, detections, box_info
+    for box in result.boxes:
+        cls_id = int(box.cls.item())
+        if cls_id not in interest_ids:
+            continue
+        name = result.names[cls_id]
+        conf = float(box.conf.item())
+        x1, y1, x2, y2 = box.xyxy[0].cpu().numpy().astype(int)
+        cv2.rectangle(frame, (x1, y1), (x2, y2), _GUN_COLOR, 2)
+        cv2.putText(frame, f"{name} {conf:.2f}", (x1, max(y1 - 6, 15)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, _GUN_COLOR, 2, cv2.LINE_AA)
+        detections.append(name)
+        box_info.append({"name": name, "conf": conf})
+    return frame, detections, box_info
+
+def _load_yolo(device="cpu"):
+    if not _YOLO_AVAILABLE:
+        return None, []
+    weights = str(SRC_PATH / "best.pt")
+    try:
+        yolo = _YOLO(weights)
+        yolo.to(device)
+        ids = _build_interest_ids(yolo)
+        print(f"[YOLO] Gun model loaded — classes: {[yolo.names[i] for i in ids]}")
+        return yolo, ids
+    except Exception as e:
+        print("⚠ YOLO load failed:", e)
+        return None, []
+
+
 # ── Detection Thread ───────────────────────────────────────────────────────────
 def detection_loop(source, buffer_size, skip, threshold):
     global _latest_frame
@@ -126,6 +270,12 @@ def detection_loop(source, buffer_size, skip, threshold):
 
     # Load CLIP
     clip_model, preprocess = clip.load("ViT-B/16", device=device)
+
+    # Load YOLO
+    yolo_detector, yolo_interest_ids = _load_yolo(device)
+
+    # Preload HF Classifier in the main detection thread to avoid meta device issues
+    _get_hf_classifier()
 
     # Load DSANet
     args        = ucf_option.parser.parse_args([])
@@ -153,6 +303,7 @@ def detection_loop(source, buffer_size, skip, threshold):
     score       = 0.0
     label       = "Buffering..."
     is_anomaly  = False
+    last_db_save = 0.0
 
     while not _stop_event.is_set():
         ret, frame = cap.read()
@@ -184,8 +335,36 @@ def detection_loop(source, buffer_size, skip, threshold):
             score           = infer_buffer(model, visual_features, prompt_text, args, device)
             is_anomaly      = score > threshold
 
-            if is_anomaly:
+            # ── YOLO gun detection ─────────────────────────────────────────
+            yolo_detections, yolo_boxes = [], []
+            if yolo_detector is not None:
+                results = yolo_detector(frame, imgsz=320, conf=0.40, verbose=False, half=(device == "cuda"))
+                if len(results) > 0:
+                    frame, yolo_detections, yolo_boxes = _draw_yolo(
+                        frame, results[0], yolo_interest_ids
+                    )
+                    if yolo_detections:
+                        unique = sorted(set(yolo_detections))
+                        cv2.putText(
+                            frame,
+                            "WEAPON: " + ", ".join(unique),
+                            (20, 80), cv2.FONT_HERSHEY_SIMPLEX,
+                            0.7, _GUN_COLOR, 2, cv2.LINE_AA,
+                        )
+
+            has_weapon = bool(yolo_detections)
+            is_danger  = is_anomaly or has_weapon
+
+            if is_anomaly and has_weapon:
+                label = "CRIME & WEAPON DETECTED"
+            elif is_anomaly:
                 label = "CRIME DETECTED"
+            elif has_weapon:
+                label = "WEAPON DETECTED"
+            else:
+                label = "NORMAL"
+
+            if is_danger:
                 alert = {
                     "time":      time.strftime("%H:%M:%S"),
                     "score":     round(score, 3),
@@ -193,22 +372,46 @@ def detection_loop(source, buffer_size, skip, threshold):
                 }
                 with _lock:
                     state["alerts"].insert(0, alert)
-                    state["alerts"] = state["alerts"][:50]   # keep last 50
-            else:
-                label = "NORMAL"
+                    state["alerts"] = state["alerts"][:50]
+
+            # ── Save danger frame to DB ────────────────────────────────────
+            if is_danger:
+                current_time = time.time()
+                if current_time - last_db_save >= 1.0:
+                    last_db_save = current_time
+                    if is_anomaly and has_weapon:
+                        danger_type = "both"
+                    elif is_anomaly:
+                        danger_type = "crime"
+                    else:
+                        danger_type = "weapon"
+
+                    weapon_names = sorted(set(yolo_detections))
+                    # snapshot the annotated frame BEFORE _encode_frame overlays more text
+                    frame_snapshot = frame.copy()
+                    threading.Thread(
+                        target=save_danger_frame,
+                        args=(score, label, danger_type, weapon_names, frame_snapshot),
+                        daemon=True,
+                    ).start()
+                    with _lock:
+                        state["history_count"] += 1
+
         else:
-            label = f"Buffering ({len(buffer)}/{buffer_size})"
+            label      = f"Buffering ({len(buffer)}/{buffer_size})"
+            yolo_detections = []
+            is_danger = False
 
         # Update shared state
         with _lock:
             state["score"]      = round(score, 4)
             state["label"]      = label
-            state["is_anomaly"] = is_anomaly
+            state["is_anomaly"] = is_danger
             state["frames_proc"] += 1
             state["score_history"].append(round(score, 4))
-            state["score_history"] = state["score_history"][-120:]   # last 120 readings
+            state["score_history"] = state["score_history"][-120:]
 
-        _encode_frame(frame, score, label, is_anomaly)
+        _encode_frame(frame, score, label, is_danger)
 
     cap.release()
     with _lock:
@@ -244,6 +447,7 @@ async def broadcast_loop():
                 "alerts":        state["alerts"][:10],
                 "running":       state["running"],
                 "device":        state["device"],
+                "history_count": state["history_count"],
             })
         dead = []
         for ws in _ws_clients:
@@ -319,6 +523,63 @@ def get_alerts():
 def clear_alerts():
     with _lock:
         state["alerts"] = []
+    return {"status": "cleared"}
+
+
+@app.get("/api/history")
+def get_history(limit: int = 50, offset: int = 0):
+    """Return danger events (newest first), with frame as base64 JPEG."""
+    con = sqlite3.connect(str(DB_PATH))
+    con.row_factory = sqlite3.Row
+    rows = con.execute(
+        "SELECT id, timestamp, score, label, danger_type, weapons, crime_type "
+        "FROM danger_events ORDER BY id DESC LIMIT ? OFFSET ?",
+        (limit, offset)
+    ).fetchall()
+    # Count total
+    total = con.execute("SELECT COUNT(*) FROM danger_events").fetchone()[0]
+    con.close()
+    return {
+        "total": total,
+        "events": [
+            {
+                "id":          r["id"],
+                "timestamp":   r["timestamp"],
+                "score":       r["score"],
+                "label":       r["label"],
+                "danger_type": r["danger_type"],
+                "weapons":     json.loads(r["weapons"]),
+                "crime_type":  r["crime_type"] if "crime_type" in r.keys() else "Unknown",
+            }
+            for r in rows
+        ],
+    }
+
+
+@app.get("/api/history/{event_id}/frame")
+def get_history_frame(event_id: int):
+    """Return the raw JPEG bytes for a single danger event."""
+    con = sqlite3.connect(str(DB_PATH))
+    row = con.execute(
+        "SELECT frame_jpeg FROM danger_events WHERE id = ?", (event_id,)
+    ).fetchone()
+    con.close()
+    if row is None:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=404, detail="Event not found")
+    from fastapi.responses import Response
+    return Response(content=row[0], media_type="image/jpeg")
+
+
+@app.delete("/api/history")
+def clear_history():
+    """Permanently delete all saved danger events."""
+    con = sqlite3.connect(str(DB_PATH))
+    con.execute("DELETE FROM danger_events")
+    con.commit()
+    con.close()
+    with _lock:
+        state["history_count"] = 0
     return {"status": "cleared"}
 
 
